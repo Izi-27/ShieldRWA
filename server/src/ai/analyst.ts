@@ -207,15 +207,33 @@ export function deterministicReasoning(
   return `${observation} That puts the composite at ${composite.toFixed(0)}, in the ${band} band.${outlook}`;
 }
 
+/** The deterministic result, before any model has seen it. */
+export interface AssessmentDraft {
+  compositeScore: number;
+  band: RiskAssessment["band"];
+  classScores: ClassScores;
+  escalationProbability: number;
+}
+
 export interface AnalyseInput {
   snapshot: SignalSnapshot;
   previousClasses?: ClassScores;
   positionValueUsd: number;
+  /**
+   * Decides whether this assessment is worth a model call, given the scores
+   * just computed. Omit to always call.
+   *
+   * The scoring runs every cycle and costs nothing; the narrative only changes
+   * when the picture does. Gating here — rather than throttling at the
+   * transport — means a skipped call still produces a complete, correct
+   * assessment, just with deterministic prose.
+   */
+  shouldNarrate?: (draft: AssessmentDraft) => boolean;
 }
 
 /**
  * Produce a full risk assessment. Scores are always deterministic; the model
- * supplies interpretation when it is available and healthy.
+ * supplies interpretation when it is available, healthy and warranted.
  */
 export async function analyse(input: AnalyseInput): Promise<RiskAssessment> {
   const { snapshot, previousClasses, positionValueUsd } = input;
@@ -227,7 +245,17 @@ export async function analyse(input: AnalyseInput): Promise<RiskAssessment> {
   const computedFactors = topFactors(snapshot, classes);
   const trajectory = projectTrajectory(composite, classes, config.risk.predictionHorizonHours);
 
-  const aiResult = await callStructured<AnalystOutput>({
+  const narrate =
+    input.shouldNarrate?.({
+      compositeScore: composite,
+      band: bandOf(composite),
+      classScores: classes,
+      escalationProbability: escalation,
+    }) ?? true;
+
+  const aiResult = !narrate
+    ? null
+    : await callStructured<AnalystOutput>({
     label: "risk-analyst",
     system: ANALYST_SYSTEM,
     prompt: buildPrompt(

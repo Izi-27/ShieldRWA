@@ -7,6 +7,7 @@ import * as repo from "../db/repositories.js";
 import { AuthError, issueNonce, verifySignIn } from "../auth/siwe.js";
 import { requireAuth, requirePositionOwner } from "../auth/middleware.js";
 import { getChainService } from "../chain/service.js";
+import { budgetStatus } from "../ai/budget.js";
 import type { ProtectionEngine } from "../pipeline/engine.js";
 import { POSTURES } from "../domain/types.js";
 import { logger } from "../logger.js";
@@ -83,7 +84,12 @@ export function buildRoutes(engine: ProtectionEngine): Router {
       env: config.env,
       time: new Date().toISOString(),
       chain: chainHealth,
-      ai: { enabled: config.ai.enabled, model: config.ai.enabled ? config.ai.model : null },
+      ai: {
+        enabled: config.ai.enabled,
+        provider: config.ai.provider,
+        model: config.ai.enabled ? config.ai.model : null,
+        budget: budgetStatus(),
+      },
       marketData: config.marketData.provider,
     });
   });

@@ -11,6 +11,13 @@ import type { AiProvider, StructuredRequest, StructuredResult } from "./types.js
  * minItems/maxItems, description, additionalProperties), so the Analyst and
  * Guardian schemas are passed through unchanged.
  */
+/**
+ * Head-room added to every request's token ceiling to cover Gemini's internal
+ * reasoning, which is billed against the same `max_output_tokens` budget as the
+ * visible response.
+ */
+const THINKING_ALLOWANCE_TOKENS = 6_000;
+
 export class GeminiProvider implements AiProvider {
   readonly name = "gemini";
   readonly model: string;
@@ -52,7 +59,12 @@ export class GeminiProvider implements AiProvider {
         },
         generation_config: {
           thinking_level: this.thinkingLevel(),
-          max_output_tokens: request.maxTokens,
+          // Reasoning tokens are drawn from this same budget on Gemini, so the
+          // ceiling has to cover thinking *and* the JSON. Sized at the caller's
+          // request plus a reasoning allowance: too tight and the model spends
+          // the budget thinking, then emits a payload that stops mid-string —
+          // which surfaces confusingly as a schema-validation failure.
+          max_output_tokens: request.maxTokens + THINKING_ALLOWANCE_TOKENS,
         },
       } as Parameters<typeof this.client.interactions.create>[0]);
 

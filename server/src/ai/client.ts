@@ -1,5 +1,6 @@
 import { config } from "../config.js";
 import { logger } from "../logger.js";
+import { parseRetryAfterSeconds, recordRateLimit, tryReserve } from "./budget.js";
 import { AnthropicProvider } from "./providers/anthropic.js";
 import { GeminiProvider } from "./providers/gemini.js";
 import type { AiProvider, ProviderFailure } from "./providers/types.js";
@@ -89,6 +90,11 @@ export async function callStructured<T>(opts: StructuredCallOptions<T>): Promise
   const active = getProvider();
   if (!active) return null;
 
+  // Never exceed the provider's quota. Skipping here is strictly better than
+  // being rejected: a 429 costs latency, produces an error log, and still ends
+  // in the deterministic fallback.
+  if (!tryReserve(opts.label)) return null;
+
   const started = Date.now();
   const result = await active.generateStructured({
     label: opts.label,
@@ -99,6 +105,11 @@ export async function callStructured<T>(opts: StructuredCallOptions<T>): Promise
   });
 
   if (!result.json) {
+    // 429 is the provider telling us its real quota. Honour it rather than
+    // continuing to spend requests that will certainly be rejected.
+    if (result.failure?.status === 429) {
+      recordRateLimit(parseRetryAfterSeconds(result.failure.message));
+    }
     lastError = {
       label: opts.label,
       at: Date.now(),
@@ -124,18 +135,35 @@ export async function callStructured<T>(opts: StructuredCallOptions<T>): Promise
     );
     return validated;
   } catch (err) {
-    // The call succeeded but the payload did not match the schema — most often
-    // a provider that ignored the response format and returned prose.
+    // Distinguish a truncated response from a genuine schema mismatch. Both
+    // land here as a parse error, but they need different fixes: truncation
+    // means the token ceiling is too low, while a mismatch means the provider
+    // ignored the response format. Reporting the first as the second sends you
+    // looking in entirely the wrong place.
+    // Truncation means it *began* as JSON and never closed. A response that
+    // was never JSON at all is a provider ignoring the response format, which
+    // is a different fault with a different fix.
+    const trimmed = result.json.trim();
+    const looksTruncated = trimmed.startsWith("{") && !trimmed.endsWith("}");
+
     lastError = {
       label: opts.label,
       at: Date.now(),
-      message: `response did not match the requested schema: ${
-        err instanceof Error ? err.message : String(err)
-      }`,
+      message: looksTruncated
+        ? "response was cut off before the JSON closed — the output token ceiling is too low " +
+          "(on Gemini, reasoning tokens share this budget)"
+        : `response did not match the requested schema: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
     };
     logger.warn(
-      { err, label: opts.label, provider: active.name, sample: result.json.slice(0, 200) },
-      "AI response failed schema validation",
+      {
+        label: opts.label,
+        provider: active.name,
+        truncated: looksTruncated,
+        tail: result.json.slice(-80),
+      },
+      looksTruncated ? "AI response truncated" : "AI response failed schema validation",
     );
     return null;
   }

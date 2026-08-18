@@ -382,11 +382,16 @@ describe("controlled risk event → decision → approval", () => {
   it("refuses to approve a decision belonging to another wallet's position", async () => {
     const tokenA = await signIn(account);
     const positionId = await registerPosition(tokenA);
-    await request(app)
-      .post(`/api/positions/${positionId}/events`)
-      .set("Authorization", `Bearer ${tokenA}`)
-      .send({ kind: "issuer", severity: 0.95, durationSeconds: 600 })
-      .expect(201);
+    // A compound scenario is needed to genuinely cross the Balanced posture's
+    // intervention threshold. An issuer event alone leaves the composite in the
+    // MEDIUM band, where the correct outcome is HOLD and no decision is raised.
+    for (const kind of ["issuer", "liquidity", "oracle"] as const) {
+      await request(app)
+        .post(`/api/positions/${positionId}/events`)
+        .set("Authorization", `Bearer ${tokenA}`)
+        .send({ kind, severity: 0.95, durationSeconds: 600 })
+        .expect(201);
+    }
 
     const state = await request(app)
       .get(`/api/positions/${positionId}`)

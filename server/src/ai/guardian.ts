@@ -77,7 +77,7 @@ Apply these tests in order:
 
 Reject unnecessarily aggressive protection. A full EXIT is justified only when the position faces severe escalating risk and a partial rotation genuinely would not contain it.
 
-Write the rationale for the investor. If you overrode the Analyst, say so plainly and give the number that decided it.`;
+Write the rationale for the investor in two to four sentences. If you overrode the Analyst, say so plainly and give the number that decided it. Be brief: this is read on a dashboard, not in a report.`;
 
 function buildPrompt(
   assessment: RiskAssessment,
@@ -126,11 +126,29 @@ EXECUTION ECONOMICS
 Decide what executes.`;
 }
 
+/** The policy's verdict, before any model has weighed in. */
+export interface DecisionDraft {
+  permittedAction: Action;
+  permittedRotationBps: number;
+  proposedAction: Action;
+  breached: boolean;
+}
+
 export interface DecideInput {
   assessment: RiskAssessment;
   policy: ProtectionPolicy;
   snapshot: SignalSnapshot;
   positionValueUsd: number;
+  /**
+   * Decides whether this decision warrants a model call.
+   *
+   * Gating on "is an action possible?" alone is not enough: a position
+   * registered above its own exposure cap breaches policy on every cycle
+   * forever, so the permitted action is permanently non-HOLD and the model
+   * would be re-consulted every few seconds to restate an identical verdict.
+   * The caller compares against the decision already pending instead.
+   */
+  shouldChallenge?: (draft: DecisionDraft) => boolean;
 }
 
 export async function decide(input: DecideInput): Promise<GuardianDecision> {
@@ -145,7 +163,24 @@ export async function decide(input: DecideInput): Promise<GuardianDecision> {
     snapshot.onchain.liquidityDepthUsd,
   );
 
-  const aiResult = await callStructured<GuardianOutput>({
+  // Nothing to challenge: the policy authorises no action and the Analyst is
+  // not asking for one. The verdict is HOLD either way, so a model call here
+  // would spend a request to restate a foregone conclusion.
+  const anyActionOnTable =
+    evaluation.permittedAction !== "HOLD" || assessment.recommendedAction !== "HOLD";
+
+  const worthChallenging =
+    anyActionOnTable &&
+    (input.shouldChallenge?.({
+      permittedAction: evaluation.permittedAction,
+      permittedRotationBps: evaluation.permittedRotationBps,
+      proposedAction: assessment.recommendedAction,
+      breached: evaluation.breached,
+    }) ?? true);
+
+  const aiResult = !worthChallenging
+    ? null
+    : await callStructured<GuardianOutput>({
     label: "risk-guardian",
     system: GUARDIAN_SYSTEM,
     prompt: buildPrompt(

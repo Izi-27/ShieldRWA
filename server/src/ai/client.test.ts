@@ -1,5 +1,6 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { callStructured, getLastAiError, setProvider } from "./client.js";
+import { budgetStatus, resetBudget } from "./budget.js";
 import type { AiProvider, StructuredResult } from "./providers/types.js";
 import { z } from "zod";
 
@@ -31,6 +32,9 @@ function call() {
   });
 }
 
+// The request budget is process-wide by design, so it must be cleared
+// between tests or later cases inherit an exhausted bucket.
+beforeEach(() => resetBudget());
 afterEach(() => setProvider(null));
 
 describe("callStructured", () => {
@@ -76,5 +80,61 @@ describe("callStructured", () => {
     setProvider(stubProvider({ json: null, failure: { message: "response contained no text" } }));
     await expect(call()).resolves.toBeNull();
     expect(getLastAiError()?.message).toContain("no text");
+  });
+});
+
+describe("request budget", () => {
+  it("stops calling the provider once the per-minute ceiling is reached", async () => {
+    const provider = stubProvider({ json: '{"action":"HOLD","size":0}' });
+    setProvider(provider);
+
+    const limit = budgetStatus().limitPerMinute;
+    expect(limit).toBeGreaterThan(0);
+
+    // Spend the whole budget.
+    for (let i = 0; i < limit; i++) {
+      await expect(call()).resolves.toEqual({ action: "HOLD", size: 0 });
+    }
+    expect(budgetStatus().remaining).toBe(0);
+
+    // The next call must never reach the provider — that is the entire point:
+    // a 429 costs latency and still ends in the deterministic fallback.
+    const callsBefore = (provider.generateStructured as ReturnType<typeof vi.fn>).mock.calls.length;
+    await expect(call()).resolves.toBeNull();
+    const callsAfter = (provider.generateStructured as ReturnType<typeof vi.fn>).mock.calls.length;
+
+    expect(callsAfter).toBe(callsBefore);
+  });
+
+  it("reports usage so /api/health can surface remaining headroom", async () => {
+    setProvider(stubProvider({ json: '{"action":"HOLD","size":0}' }));
+    const before = budgetStatus();
+    await call();
+    const after = budgetStatus();
+
+    expect(after.usedInWindow).toBe(before.usedInWindow + 1);
+    expect(after.remaining).toBe(before.remaining - 1);
+  });
+});
+
+describe("truncation versus schema mismatch", () => {
+  it("reports a cut-off JSON payload as truncation, not a schema failure", async () => {
+    // Exactly what Gemini returned when reasoning tokens ate the output budget.
+    setProvider(
+      stubProvider({
+        json: '{\n  "action": "REDUCE",\n  "size": 34,\n  "why": "the investor',
+      }),
+    );
+
+    await expect(call()).resolves.toBeNull();
+    expect(getLastAiError()?.message).toMatch(/cut off before the JSON closed/i);
+  });
+
+  it("still reports prose as a schema mismatch", async () => {
+    // Prose also fails to end in "}", so the check must look at the start too.
+    setProvider(stubProvider({ json: "I recommend reducing exposure by about a third." }));
+
+    await expect(call()).resolves.toBeNull();
+    expect(getLastAiError()?.message).toMatch(/did not match the requested schema/i);
   });
 });

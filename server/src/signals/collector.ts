@@ -1,3 +1,4 @@
+import { BASELINE_CONCENTRATION } from "../domain/types.js";
 import type {
   AssetSignals,
   InjectedEvent,
@@ -92,7 +93,7 @@ function derivePortfolio(input: CollectorInput, onchain: OnchainSignals): Portfo
   const defensiveShare = input.chainState?.defensiveShare ?? 0;
 
   // Single-asset vault: concentration is whatever is not yet rotated out.
-  const concentration = Math.max(0.05, 0.61 * (1 - defensiveShare));
+  const concentration = Math.max(0.05, BASELINE_CONCENTRATION * (1 - defensiveShare));
 
   // Correlated exposure rises with issuer stress across the same asset class.
   const issuerEvent = input.injectedEvents.find((e) => e.kind === "issuer");

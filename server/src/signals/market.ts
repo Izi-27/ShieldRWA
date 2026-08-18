@@ -195,11 +195,64 @@ function round(value: number, dp: number): number {
   return Math.round(value * f) / f;
 }
 
-export function createMarketProvider(): MarketProvider {
-  if (config.marketData.provider === "coingecko") {
-    logger.info({ asset: config.marketData.referenceAsset }, "using live market data");
-    return new CoinGeckoProvider();
+/**
+ * Serves one upstream sample to every caller inside a short window.
+ *
+ * The pipeline samples once per position per cycle: at a 5s cycle with two
+ * positions that is 24 requests a minute to a public price API, which will be
+ * rate-limited well before it is useful. Prices do not move meaningfully
+ * between cycles, and every position references the same asset, so one read
+ * serves them all.
+ *
+ * Concurrent callers share the in-flight request rather than each starting one.
+ */
+export class CachedMarketProvider implements MarketProvider {
+  readonly kind: "live" | "simulated";
+
+  private cached: { at: number; value: MarketSignals } | null = null;
+  private inFlight: Promise<MarketSignals> | null = null;
+
+  constructor(
+    private readonly inner: MarketProvider,
+    private readonly ttlMs: number,
+  ) {
+    this.kind = inner.kind;
   }
+
+  async sample(): Promise<MarketSignals> {
+    if (this.cached && Date.now() - this.cached.at < this.ttlMs) {
+      return this.cached.value;
+    }
+    if (this.inFlight) return this.inFlight;
+
+    this.inFlight = this.inner
+      .sample()
+      .then((value) => {
+        this.cached = { at: Date.now(), value };
+        return value;
+      })
+      .finally(() => {
+        this.inFlight = null;
+      });
+
+    return this.inFlight;
+  }
+}
+
+export function createMarketProvider(): MarketProvider {
+  const ttl = config.marketData.cacheMs;
+
+  if (config.marketData.provider === "coingecko") {
+    logger.info(
+      { asset: config.marketData.referenceAsset, cacheMs: ttl },
+      "using live market data",
+    );
+    return new CachedMarketProvider(new CoinGeckoProvider(), ttl);
+  }
+
   logger.info("using simulated market data");
-  return new SimulatedMarketProvider();
+  // The simulator is free to call, but caching it too keeps the sampling
+  // cadence identical between providers so behaviour does not change with the
+  // configuration.
+  return new CachedMarketProvider(new SimulatedMarketProvider(), ttl);
 }

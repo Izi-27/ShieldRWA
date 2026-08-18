@@ -15,6 +15,7 @@ import {
   logActivity,
   pendingDecision,
   protectionTotals,
+  recentlyRejectedDecision,
   purgeExpiredNonces,
   saveAssessment,
   saveDecision,
@@ -310,5 +311,58 @@ describe("injected events", () => {
 
     expect(clearInjectedEvents(db, p.id)).toBe(1);
     expect(activeInjectedEvents(db, p.id)).toHaveLength(0);
+  });
+});
+
+describe("rejection suppression", () => {
+  it("surfaces a recently rejected decision so it is not re-proposed", () => {
+    const p = createPosition(db, {
+      ownerAddress: ADDRESS,
+      assetSymbol: "X",
+      assetName: "n",
+      valueUsd: 10_000,
+    });
+    const a = seedAssessment(p.id);
+    const d = seedDecision(p.id, a.id);
+
+    // Nothing rejected yet.
+    expect(recentlyRejectedDecision(db, p.id, 5 * 60_000)).toBeNull();
+
+    setDecisionStatus(db, d.id, "rejected");
+    const found = recentlyRejectedDecision(db, p.id, 5 * 60_000);
+    expect(found?.id).toBe(d.id);
+    expect(found?.finalAction).toBe("REDUCE");
+  });
+
+  it("lets the proposal return once the cooldown has elapsed", () => {
+    const p = createPosition(db, {
+      ownerAddress: ADDRESS,
+      assetSymbol: "X",
+      assetName: "n",
+      valueUsd: 10_000,
+    });
+    const a = seedAssessment(p.id);
+    const d = seedDecision(p.id, a.id);
+    setDecisionStatus(db, d.id, "rejected");
+
+    // A window that ended before the rejection must not match it.
+    const future = Date.now() + 10 * 60_000;
+    expect(recentlyRejectedDecision(db, p.id, 60_000, future)).toBeNull();
+  });
+
+  it("ignores decisions resolved any other way", () => {
+    const p = createPosition(db, {
+      ownerAddress: ADDRESS,
+      assetSymbol: "X",
+      assetName: "n",
+      valueUsd: 10_000,
+    });
+    const a = seedAssessment(p.id);
+    const d = seedDecision(p.id, a.id);
+
+    // Approving is not declining — an approved action must not suppress the
+    // next proposal.
+    setDecisionStatus(db, d.id, "approved");
+    expect(recentlyRejectedDecision(db, p.id, 5 * 60_000)).toBeNull();
   });
 });

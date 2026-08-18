@@ -11,6 +11,7 @@ import type {
   RiskAssessment,
   SignalSnapshot,
 } from "../domain/types.js";
+import { defaultExposureCapBps } from "../domain/types.js";
 import { newId } from "../util/id.js";
 
 /**
@@ -206,7 +207,9 @@ const toPolicy = (r: PolicyRow): ProtectionPolicy => ({
 export const DEFAULT_POLICY = {
   posture: "Balanced" as const,
   maxDrawdownBps: 1_000,
-  maxExposureBps: 4_000,
+  // Derived from where a position actually starts rather than a fixed number,
+  // so a new policy is never breached on creation. See defaultExposureCapBps.
+  maxExposureBps: defaultExposureCapBps(),
   minLiquidityUsd: 250_000,
   defensiveAsset: "USDC",
   mode: "MANUAL" as const,
@@ -466,6 +469,30 @@ export function latestDecision(db: DB, positionId: string): GuardianDecision | n
   const row = db
     .prepare(`SELECT * FROM decisions WHERE position_id = ? ORDER BY created_at DESC LIMIT 1`)
     .get(positionId) as DecisionRow | undefined;
+  return row ? toDecision(row) : null;
+}
+
+/**
+ * Most recent decision the user actively rejected, within `withinMs`.
+ *
+ * Used to stop the pipeline re-proposing something the user just declined. A
+ * rejection is an instruction, not a one-off dismissal: without this the next
+ * cycle raises an equivalent decision a few seconds later and the approval
+ * dialog reappears indefinitely.
+ */
+export function recentlyRejectedDecision(
+  db: DB,
+  positionId: string,
+  withinMs: number,
+  now = Date.now(),
+): GuardianDecision | null {
+  const row = db
+    .prepare(
+      `SELECT * FROM decisions
+       WHERE position_id = ? AND status = 'rejected' AND resolved_at >= ?
+       ORDER BY resolved_at DESC LIMIT 1`,
+    )
+    .get(positionId, now - withinMs) as DecisionRow | undefined;
   return row ? toDecision(row) : null;
 }
 

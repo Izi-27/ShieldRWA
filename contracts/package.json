@@ -7,7 +7,9 @@
     "test": "hardhat test",
     "node": "hardhat node",
     "deploy:local": "hardhat run scripts/deploy.ts --network localhost",
-    "deploy:xlayer": "hardhat run scripts/deploy.ts --network xlayerTestnet"
+    "deploy:xlayer": "hardhat run scripts/deploy.ts --network xlayerTestnet",
+    "preflight": "hardhat run scripts/preflight.ts --network xlayerTestnet",
+    "fund:xlayer": "hardhat run scripts/fund-vault.ts --network xlayerTestnet"
   },
   "devDependencies": {
     "@nomicfoundation/hardhat-toolbox": "^5.0.0",

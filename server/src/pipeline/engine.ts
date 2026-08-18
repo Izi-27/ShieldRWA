@@ -28,16 +28,38 @@ import type {
  * cycle rather than racing it.
  */
 
+/**
+ * How long a rejected proposal suppresses an equivalent one. Long enough that
+ * declining is meaningful, short enough that a genuinely worsening position
+ * can still ask again.
+ */
+const REJECTION_COOLDOWN_MS = 5 * 60_000;
+
+/** How long automatic execution pauses after a failed attempt. */
+const EXECUTION_RETRY_COOLDOWN_MS = 60_000;
+
 interface PositionRuntime {
   previousClasses?: ClassScores;
   lastAnchorAt: number;
   running: boolean;
   lastBand?: string;
+  /** When the Analyst last produced a model-written narrative. */
+  lastNarratedAt: number;
+  /** Composite score at that narration, to detect material drift since. */
+  lastNarratedScore?: number;
+  /** When the Guardian last consulted the model. */
+  lastChallengedAt: number;
+  /** Signature of the inputs it was consulted about. */
+  lastChallengeKey?: string;
 }
 
 export class ProtectionEngine {
   private timer: NodeJS.Timeout | null = null;
   private readonly runtime = new Map<string, PositionRuntime>();
+  /** Last anchor time per vault address — see maybeAnchor. */
+  private readonly lastAnchorByVault = new Map<string, number>();
+  /** Position id -> timestamp until which AUTO execution is paused. */
+  private readonly executionCooldown = new Map<string, number>();
   private stopping = false;
 
   constructor(
@@ -110,7 +132,12 @@ export class ProtectionEngine {
         snapshot,
         previousClasses: state.previousClasses,
         positionValueUsd: position.valueUsd,
+        shouldNarrate: (draft) => this.shouldNarrate(state, draft),
       });
+      if (assessment.source === "ai") {
+        state.lastNarratedAt = Date.now();
+        state.lastNarratedScore = assessment.compositeScore;
+      }
       state.previousClasses = assessment.classScores;
       repo.saveAssessment(this.db, assessment);
       bus.publish({ type: "assessment", positionId: position.id, payload: assessment });
@@ -123,14 +150,22 @@ export class ProtectionEngine {
 
       // ---------------- DECIDE ----------------
       const policy = repo.getOrCreatePolicy(this.db, position.id);
+      const previousPending = repo.pendingDecision(this.db, position.id);
+
       const decision = await decide({
         assessment,
         policy,
         snapshot,
         positionValueUsd: position.valueUsd,
+        // Only pay for a rationale when the inputs actually changed.
+        //
+        // This deliberately keys off engine state rather than the pending
+        // decision in the database. A Guardian verdict of HOLD is never
+        // persisted as pending, so a position whose economics always favour
+        // holding left nothing to compare against and re-consulted the model
+        // every single cycle — which is what drained the request budget.
+        shouldChallenge: (draft) => this.shouldChallenge(state, draft),
       });
-
-      const previousPending = repo.pendingDecision(this.db, position.id);
 
       if (decision.finalAction === "HOLD") {
         // Nothing to approve. Record it only when it changes the picture, so
@@ -149,6 +184,19 @@ export class ProtectionEngine {
         return assessment;
       }
 
+      // Respect a rejection. The user declining an action is a decision about
+      // the position, not a dismissal of one dialog: re-raising an equivalent
+      // proposal on the next cycle reopens the approval prompt seconds later
+      // and gives them no way to say no and mean it.
+      const rejected = repo.recentlyRejectedDecision(
+        this.db,
+        position.id,
+        REJECTION_COOLDOWN_MS,
+      );
+      if (rejected && this.sameDecision(rejected, decision)) {
+        return assessment;
+      }
+
       repo.saveDecision(this.db, decision);
       repo.supersedePendingDecisions(this.db, position.id, decision.id);
       bus.publish({ type: "decision", positionId: position.id, payload: decision });
@@ -162,7 +210,25 @@ export class ProtectionEngine {
 
       // ---------------- PROTECT ----------------
       if (policy.mode === "AUTO") {
-        await this.executeDecision(position, decision, assessment);
+        // Back off after a failure. Automatic mode otherwise re-derives an
+        // identical decision every cycle and re-submits a transaction that has
+        // already reverted — burning gas and filling the log at cycle rate.
+        const cooldownUntil = this.executionCooldown.get(position.id) ?? 0;
+        if (Date.now() < cooldownUntil) {
+          return assessment;
+        }
+        const executed = await this.executeDecision(position, decision, assessment);
+        if (executed.status === "failed") {
+          this.executionCooldown.set(position.id, Date.now() + EXECUTION_RETRY_COOLDOWN_MS);
+          this.activity(
+            position.id,
+            "warning",
+            "PROTECT",
+            `Automatic execution paused for ${EXECUTION_RETRY_COOLDOWN_MS / 1_000}s after a failure`,
+          );
+        } else {
+          this.executionCooldown.delete(position.id);
+        }
       } else {
         this.activity(
           position.id,
@@ -231,8 +297,43 @@ export class ProtectionEngine {
       return this.failEvent(position.id, decision, event, "vault state unavailable");
     }
 
-    const amountAssetUnits =
-      (vaultState.totalAssets * BigInt(decision.rotationBps)) / 10_000n;
+    // Size the rotation against the RWA leg, not total assets.
+    //
+    // `totalAssets` counts value already rotated into the defensive asset, but
+    // `checkoutForProtection` can only draw on the RWA the vault still holds.
+    // On a heavily-rotated position the two diverge sharply — a vault 93%
+    // defensive has ~7% of its value left to sell — and sizing off the total
+    // produces an order the vault cannot fill, reverting with
+    // InsufficientLiquidity.
+    const requested = (vaultState.totalAssets * BigInt(decision.rotationBps)) / 10_000n;
+    const amountAssetUnits = requested > vaultState.assetBalance
+      ? vaultState.assetBalance
+      : requested;
+
+    // Refuse to send a transaction that cannot succeed.
+    if (amountAssetUnits === 0n) {
+      const defensivePct = (vaultState.defensiveShare * 100).toFixed(1);
+      return this.failEvent(
+        position.id,
+        decision,
+        event,
+        vaultState.totalAssets === 0n
+          ? "vault holds no assets — deposit into RWAPosition before protective execution can run"
+          : `no exposure left to rotate — the position is already ${defensivePct}% defensive`,
+      );
+    }
+
+    if (amountAssetUnits < requested) {
+      // Rotating what remains is still the right action; say so rather than
+      // silently protecting less than the decision promised.
+      this.activity(
+        position.id,
+        "warning",
+        "PROTECT",
+        `Rotation capped at the remaining exposure — the position is already ` +
+          `${(vaultState.defensiveShare * 100).toFixed(1)}% defensive`,
+      );
+    }
 
     const result = await this.chain.executeProtection({
       amountAssetUnits,
@@ -296,14 +397,30 @@ export class ProtectionEngine {
     };
   }
 
+  /**
+   * Anchoring is keyed by *vault*, not by position.
+   *
+   * `RiskOracle` stores one assessment per vault address, and every position
+   * currently maps to the single configured vault. Tracking the interval
+   * per-position therefore had N positions anchoring the same vault with the
+   * same payload in the same cycle: one transaction won and the rest were
+   * rejected as duplicates, burning gas budget and filling the log with nonce
+   * errors for work that was redundant by construction.
+   */
   private async maybeAnchor(
     positionId: string,
     assessment: RiskAssessment,
     state: PositionRuntime,
   ): Promise<void> {
     if (!this.chain.canSign) return;
-    if (Date.now() - state.lastAnchorAt < config.risk.anchorIntervalMs) return;
 
+    const vault = this.chain.vaultAddress ?? "unconfigured";
+    const lastForVault = this.lastAnchorByVault.get(vault) ?? 0;
+    if (Date.now() - lastForVault < config.risk.anchorIntervalMs) return;
+
+    // Claim the slot before awaiting, so a concurrent cycle cannot pass the
+    // same check and queue a duplicate behind us.
+    this.lastAnchorByVault.set(vault, Date.now());
     state.lastAnchorAt = Date.now();
     const hash = await this.chain.anchorAssessment({
       score: assessment.compositeScore,
@@ -342,6 +459,69 @@ export class ProtectionEngine {
     state.lastBand = assessment.band;
   }
 
+  /**
+   * Is a model-written narrative worth a request this cycle?
+   *
+   * The composite score, bands and trajectory are recomputed every cycle for
+   * free — only the *explanation* costs anything. Re-narrating an unchanged
+   * picture every few seconds burns a free tier in under a minute and tells
+   * the user nothing new, so the model is called when:
+   *
+   *   - nothing has been narrated yet,
+   *   - the risk band changed (the user-visible state changed),
+   *   - the score moved materially since the last narration, or
+   *   - the narrative has simply gone stale.
+   */
+  private shouldNarrate(
+    state: PositionRuntime,
+    draft: { compositeScore: number; band: string },
+  ): boolean {
+    if (state.lastNarratedAt === 0 || state.lastNarratedScore === undefined) return true;
+    if (state.lastBand !== undefined && state.lastBand !== draft.band) return true;
+
+    const drift = Math.abs(draft.compositeScore - state.lastNarratedScore);
+    if (drift >= config.ai.changeThreshold) return true;
+
+    return Date.now() - state.lastNarratedAt >= config.ai.minIntervalMs;
+  }
+
+  /**
+   * Is a model-written rationale worth a request this cycle?
+   *
+   * Keyed on the inputs the Guardian actually reasons about. When they are
+   * unchanged the previous rationale is still accurate, so the deterministic
+   * path produces the same verdict for free. The interval bound stops a
+   * long-lived position re-arguing an identical case indefinitely.
+   */
+  private shouldChallenge(
+    state: PositionRuntime,
+    draft: {
+      permittedAction: string;
+      permittedRotationBps: number;
+      proposedAction: string;
+      breached: boolean;
+    },
+  ): boolean {
+    // Round the rotation so ordinary score jitter does not read as a change.
+    const key = [
+      draft.proposedAction,
+      draft.permittedAction,
+      Math.round(draft.permittedRotationBps / 500) * 500,
+      draft.breached ? "breached" : "ok",
+    ].join("|");
+
+    if (state.lastChallengeKey !== key) {
+      state.lastChallengeKey = key;
+      state.lastChallengedAt = Date.now();
+      return true;
+    }
+    if (Date.now() - state.lastChallengedAt >= config.ai.minIntervalMs) {
+      state.lastChallengedAt = Date.now();
+      return true;
+    }
+    return false;
+  }
+
   /** Two decisions are "the same" when acting on either would be identical. */
   private sameDecision(a: GuardianDecision, b: GuardianDecision): boolean {
     return (
@@ -364,7 +544,7 @@ export class ProtectionEngine {
   private runtimeFor(positionId: string): PositionRuntime {
     let state = this.runtime.get(positionId);
     if (!state) {
-      state = { lastAnchorAt: 0, running: false };
+      state = { lastAnchorAt: 0, running: false, lastNarratedAt: 0, lastChallengedAt: 0 };
       this.runtime.set(positionId, state);
     }
     return state;

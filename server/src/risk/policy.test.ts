@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { ProtectionPolicy, RiskAssessment, SignalSnapshot } from "../domain/types.js";
+import { BASELINE_CONCENTRATION, defaultExposureCapBps } from "../domain/types.js";
 import {
   POSTURE_MAX_ROTATION_BPS,
   POSTURE_THRESHOLDS,
@@ -232,5 +233,45 @@ describe("slippage estimate", () => {
     const bps = estimateSlippageBps(3_500, 2_400_000);
     expect(bps).toBeGreaterThan(10);
     expect(bps).toBeLessThan(200);
+  });
+});
+
+describe("default policy is consistent with a new position", () => {
+  it("derives an exposure cap above the position's starting concentration", () => {
+    const cap = defaultExposureCapBps();
+    const startingBps = Math.round(BASELINE_CONCENTRATION * 10_000);
+    // A policy that is breached the moment it is created makes the breach
+    // signal meaningless and drives a protective evaluation every cycle.
+    expect(cap).toBeGreaterThan(startingBps);
+  });
+
+  it("never produces a breached cap for any starting concentration", () => {
+    for (const concentration of [0.05, 0.15, 0.35, 0.61, 0.75, 0.88]) {
+      const cap = defaultExposureCapBps(concentration);
+      expect(cap).toBeGreaterThanOrEqual(Math.round(concentration * 10_000));
+    }
+  });
+
+  it("stays inside the range the policy schema accepts", () => {
+    for (const concentration of [0.01, 0.5, 0.99, 1]) {
+      const cap = defaultExposureCapBps(concentration);
+      expect(cap).toBeGreaterThanOrEqual(4_000);
+      expect(cap).toBeLessThanOrEqual(10_000);
+    }
+  });
+
+  it("leaves a freshly registered position unbreached but flagged as concentrated", () => {
+    const freshPolicy = { ...balanced, maxExposureBps: defaultExposureCapBps() };
+    const snapshot = {
+      ...healthySnapshot,
+      portfolio: { ...healthySnapshot.portfolio, concentration: BASELINE_CONCENTRATION },
+    };
+    const result = evaluatePolicy(freshPolicy, assessment(12), snapshot, 10_000);
+
+    expect(result.breached).toBe(false);
+    expect(result.permittedAction).toBe("HOLD");
+    // Still surfaced as a warning — the concentration is genuinely high, the
+    // user just hasn't opted into a tighter limit than reality.
+    expect(result.checks.find((c) => c.key === "MAX SINGLE ASSET")?.verdict).toBe("warn");
   });
 });

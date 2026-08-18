@@ -202,6 +202,35 @@ export interface InjectedEvent {
   description: string;
 }
 
+/**
+ * Single-asset concentration a freshly registered position starts at.
+ *
+ * A single-asset vault is concentrated by construction — that is the exposure
+ * ShieldRWA exists to watch, not a fault to be alarmed about on day one.
+ */
+export const BASELINE_CONCENTRATION = 0.61;
+
+/**
+ * Default single-asset exposure cap for a position at the given concentration.
+ *
+ * A policy must not be breached the moment it is created. A cap below the
+ * position's own starting concentration puts the Guardian permanently in
+ * "limit breached" mode, which makes the breach signal meaningless — an alarm
+ * that is always on tells the investor nothing, and it drives a protective
+ * evaluation on every cycle for a condition the user never opted into.
+ *
+ * So the default sits just above where the position actually starts, rounded
+ * up to a clean 5%. Tightening it below current concentration is then a
+ * deliberate choice, and the resulting breach is real information.
+ */
+export function defaultExposureCapBps(concentration = BASELINE_CONCENTRATION): number {
+  const currentBps = Math.round(concentration * 10_000);
+  const roundedUp = Math.ceil((currentBps + 1) / 500) * 500;
+  // Never below the 40% floor a diversified portfolio would want, never above
+  // the 90% ceiling the policy schema permits.
+  return Math.min(9_000, Math.max(4_000, roundedUp));
+}
+
 export function bandOf(score: number): Band {
   if (score < 25) return "LOW";
   if (score < 50) return "MEDIUM";

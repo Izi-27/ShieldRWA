@@ -22,10 +22,12 @@ const config: HardhatUserConfig = {
       url: "http://127.0.0.1:8545",
       chainId: 31337,
     },
-    // X Layer testnet — https://web3.okx.com/xlayer
+    // X Layer testnet. Chain id verified live against the RPC
+    // (eth_chainId -> 0x7a0 = 1952); an older 195 appears in some docs and
+    // will make Hardhat abort with a network mismatch.
     xlayerTestnet: {
       url: process.env.XLAYER_RPC_URL ?? "https://testrpc.xlayer.tech",
-      chainId: 195,
+      chainId: Number(process.env.XLAYER_CHAIN_ID ?? 1952),
       accounts: DEPLOYER_KEY ? [DEPLOYER_KEY] : [],
     },
   },

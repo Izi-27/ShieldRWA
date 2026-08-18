@@ -7,6 +7,7 @@ import {
   FONT_MONO,
   FONT_SANS,
   GOLD,
+  MAUVE,
   MUTE,
   ROSE,
 } from "@/lib/theme";
@@ -115,6 +116,58 @@ export default function ProofLog({ vm }: { vm: LiveShieldVM }) {
         <div>RISK BEFORE→AFTER</div>
         <div>TX HASH</div>
       </div>
+
+      {/*
+        Without this the page renders column headers over nothing, which reads
+        as a broken screen rather than an accurate "no protective action has
+        been taken yet" — the normal state for a healthy position.
+      */}
+      {vm.history.length === 0 && (
+        <div
+          style={{
+            padding: "56px 0 24px",
+            maxWidth: "62ch",
+          }}
+        >
+          <div
+            style={{
+              fontFamily: FONT_BLACK,
+              fontSize: 26,
+              lineHeight: 1.1,
+              color: CREAM,
+            }}
+          >
+            NO PROTECTIVE ACTIONS YET
+          </div>
+          <div
+            style={{
+              height: 2,
+              width: 44,
+              background: MAUVE,
+              margin: "18px 0",
+            }}
+          />
+          <div style={{ fontSize: 14.5, lineHeight: 1.55, color: BODY }}>
+            The protection loop is running and scoring this position, but it has
+            not needed to act. Every rotation it executes will be recorded here
+            with its reasoning, the amount protected, the before and after risk
+            score, and its transaction hash.
+          </div>
+          <div
+            style={{
+              fontFamily: FONT_MONO,
+              fontSize: 11.5,
+              letterSpacing: "0.1em",
+              color: MUTE,
+              marginTop: 22,
+              lineHeight: 1.8,
+            }}
+          >
+            To see one: open the dashboard, trigger a controlled risk event, and
+            approve the action the Guardian proposes.
+          </div>
+        </div>
+      )}
 
       {vm.history.map((h, i) => (
         <HoverBox

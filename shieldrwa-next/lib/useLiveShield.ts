@@ -78,6 +78,7 @@ export function useLiveShield() {
   const [totals, setTotals] = useState({ count: 0, totalProtectedUsd: 0 });
   const [eventActive, setEventActive] = useState(false);
   const [live, setLive] = useState(false);
+  const [dismissedDecisions, setDismissedDecisions] = useState<Set<string>>(new Set());
 
   const socketRef = useRef<{ close: () => void } | null>(null);
 
@@ -250,9 +251,19 @@ export function useLiveShield() {
           assetName: "RWA Treasury Note T3",
           valueUsd,
         });
-        // Give the first pipeline cycle a moment to land before rendering.
-        await new Promise((r) => setTimeout(r, 600));
-        await loadPosition(created.id);
+
+        // Wait for the first assessment rather than guessing at a delay. The
+        // opening cycle reads live vault state over RPC, so it can take a few
+        // seconds — a fixed sleep either rendered an empty dashboard or stalled
+        // the UI for no reason. Give up quickly either way: the WebSocket
+        // delivers the assessment the moment it lands.
+        const deadline = Date.now() + 6_000;
+        for (;;) {
+          await loadPosition(created.id);
+          const ready = await api.getPosition(created.id).catch(() => null);
+          if (ready?.assessment || Date.now() > deadline) break;
+          await new Promise((r) => setTimeout(r, 700));
+        }
         return created;
       } finally {
         setBusy(null);
@@ -298,8 +309,28 @@ export function useLiveShield() {
     }
   }, [position, eventActive, loadPosition]);
 
+  /**
+   * Decisions the user has already acted on.
+   *
+   * The modal must close the instant it is answered and stay closed. Clearing
+   * `decision` alone is not enough: the reload that follows repopulates it from
+   * the server, and the pipeline may have raised a fresh proposal in the
+   * meantime — so the dialog reappeared seconds after being dismissed.
+   */
+  const dismissDecision = useCallback((id: string) => {
+    setDismissedDecisions((prev) => {
+      const next = new Set(prev);
+      next.add(id);
+      return next;
+    });
+  }, []);
+
   const approve = useCallback(async () => {
     if (!position || !decision) return;
+    // Dismiss before awaiting. Doing it after meant a failed request — an
+    // already-executed decision returning 409, say — left the dialog stuck open
+    // with no way to close it.
+    dismissDecision(decision.id);
     setBusy("approve");
     try {
       await api.approveDecision(position.id, decision.id);
@@ -310,7 +341,7 @@ export function useLiveShield() {
     } finally {
       setBusy(null);
     }
-  }, [position, decision, loadPosition]);
+  }, [position, decision, loadPosition, dismissDecision]);
 
   const reject = useCallback(async () => {
     if (!position || !decision) return;
@@ -503,6 +534,23 @@ export function useLiveShield() {
     ul: limits[key] === label ? MAUVE : "transparent",
     fg: limits[key] === label ? CREAM : "#7A6D6A",
   });
+
+  /**
+   * Builds the choices for one policy limit, always including whatever the
+   * policy is currently set to.
+   *
+   * The server derives a position's default exposure cap from its actual
+   * concentration, so it will not always land on one of the presets. Without
+   * this the current value renders as unselected — and every offered option
+   * sits below it, so any click would tighten the cap into an immediate breach.
+   */
+  const optionsFor = (key: keyof typeof limits, presets: string[]) => {
+    const current = limits[key];
+    const all = presets.includes(current) ? presets : [...presets, current];
+    return all
+      .sort((a, b) => numericValue(a) - numericValue(b))
+      .map((label) => mkOpt(key, label));
+  };
 
   const positionValue = position?.valueUsd ?? 0;
   const eventBusy = busy === "event";
@@ -799,17 +847,17 @@ export function useLiveShield() {
       {
         label: "MAXIMUM ACCEPTABLE DRAWDOWN",
         hint: "Protection engages before the position falls past this.",
-        options: ["5%", "10%", "15%"].map((o) => mkOpt("drawdown", o)),
+        options: optionsFor("drawdown", ["5%", "10%", "15%"]),
       },
       {
         label: "MAXIMUM SINGLE-ASSET EXPOSURE",
         hint: "Caps concentration across the protected portfolio.",
-        options: ["25%", "40%", "60%"].map((o) => mkOpt("exposure", o)),
+        options: optionsFor("exposure", ["40%", "60%", "80%"]),
       },
       {
         label: "MINIMUM LIQUIDITY REQUIREMENT",
         hint: "Depth below this counts as a material risk signal.",
-        options: ["$100K", "$250K", "$500K"].map((o) => mkOpt("liquidity", o)),
+        options: optionsFor("liquidity", ["$100K", "$250K", "$500K"]),
       },
       {
         label: "PREFERRED STABLECOIN FOR ROTATION",
@@ -829,7 +877,9 @@ export function useLiveShield() {
       : "Register a position to configure its protection policy.",
 
     /* ----- decision modal ----- */
-    modalOpen: Boolean(decision && decision.status === "pending"),
+    modalOpen: Boolean(
+      decision && decision.status === "pending" && !dismissedDecisions.has(decision.id),
+    ),
     modal: decision
       ? {
           action: decision.finalAction,
@@ -918,6 +968,11 @@ function relativeTime(timestamp: number): string {
   if (minutes < 60) return `${String(minutes).padStart(2, "0")}M AGO`;
   const hours = Math.floor(minutes / 60);
   return `${String(hours).padStart(2, "0")}H AGO`;
+}
+
+/** Sort key for policy option labels like "65%" or "$250K". */
+function numericValue(label: string): number {
+  return parseCompactUsd(label.replace("%", ""));
 }
 
 function formatCompactUsd(value: number): string {

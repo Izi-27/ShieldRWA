@@ -75,8 +75,19 @@ export default function Header({ vm }: { vm: LiveShieldVM }) {
             {item.label}
           </HoverButton>
         ))}
+        {/*
+          Runs the real wallet handshake. This previously called `goOnboard`,
+          which only changed the view — a leftover from the scripted mock, and
+          the reason the button appeared to do nothing.
+        */}
         <HoverButton
-          onClick={vm.goOnboard}
+          onClick={vm.connected ? vm.goDash : () => void vm.connect()}
+          disabled={vm.connection === "connecting"}
+          title={
+            vm.connected
+              ? "Open the dashboard"
+              : "Connect your wallet and sign in"
+          }
           hoverStyle={{ color: GOLD }}
           style={{
             appearance: "none",
@@ -87,7 +98,7 @@ export default function Header({ vm }: { vm: LiveShieldVM }) {
             fontSize: 11,
             letterSpacing: "0.12em",
             fontWeight: 600,
-            cursor: "pointer",
+            cursor: vm.connection === "connecting" ? "wait" : "pointer",
             padding: "20px 0 18px",
             transition: "color .15s",
           }}

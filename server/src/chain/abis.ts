@@ -165,6 +165,72 @@ export const protectionExecutorAbi = [
     inputs: [],
     outputs: [{ type: "uint16" }],
   },
+  // Custom errors must be in the ABI for viem to decode a revert. Without
+  // them a revert surfaces as the raw 4-byte selector rendered as text —
+  // e.g. "execution reverted: * " — which says nothing.
+  { type: "error", name: "StaleAssessment", inputs: [{ name: "position", type: "address" }] },
+  { type: "error", name: "RouterNotAllowed", inputs: [{ name: "router", type: "address" }] },
+  {
+    type: "error",
+    name: "RotationTooLarge",
+    inputs: [
+      { name: "requestedBps", type: "uint256" },
+      { name: "maxBps", type: "uint16" },
+    ],
+  },
+  {
+    type: "error",
+    name: "SlippageExceeded",
+    inputs: [
+      { name: "received", type: "uint256" },
+      { name: "minimum", type: "uint256" },
+    ],
+  },
+  { type: "error", name: "UnsupportedAction", inputs: [{ name: "action", type: "uint8" }] },
+  { type: "error", name: "ZeroAmount", inputs: [] },
+  { type: "error", name: "SwapFailed", inputs: [] },
+  // Errors raised by the contracts the executor calls into. A revert bubbles up
+  // through `executeProtection`, so viem decodes it against *this* ABI — if the
+  // nested error is absent the reason is lost and you get a bare
+  // "execution reverted" that names nothing.
+  { type: "error", name: "NothingPending", inputs: [] },
+  { type: "error", name: "EnforcedPause", inputs: [] },
+  { type: "error", name: "ReentrancyGuardReentrantCall", inputs: [] },
+  { type: "error", name: "SafeERC20FailedOperation", inputs: [{ name: "token", type: "address" }] },
+  {
+    type: "error",
+    name: "AccessControlUnauthorizedAccount",
+    inputs: [
+      { name: "account", type: "address" },
+      { name: "neededRole", type: "bytes32" },
+    ],
+  },
+  {
+    type: "error",
+    name: "ERC20InsufficientBalance",
+    inputs: [
+      { name: "sender", type: "address" },
+      { name: "balance", type: "uint256" },
+      { name: "needed", type: "uint256" },
+    ],
+  },
+  {
+    type: "error",
+    name: "ERC20InsufficientAllowance",
+    inputs: [
+      { name: "spender", type: "address" },
+      { name: "allowance", type: "uint256" },
+      { name: "needed", type: "uint256" },
+    ],
+  },
+  {
+    type: "error",
+    name: "InsufficientLiquidity",
+    inputs: [
+      { name: "requested", type: "uint256" },
+      { name: "available", type: "uint256" },
+    ],
+  },
   {
     type: "event",
     name: "ProtectionExecuted",

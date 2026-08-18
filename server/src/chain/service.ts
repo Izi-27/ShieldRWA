@@ -27,6 +27,11 @@ import { erc20Abi, protectionExecutorAbi, riskOracleAbi, rwaPositionAbi } from "
 
 export interface VaultState {
   totalAssets: bigint;
+  /**
+   * The RWA leg only. A rotation can draw on this, never on totalAssets,
+   * which also counts value already sitting in the defensive asset.
+   */
+  assetBalance: bigint;
   totalAssetsFormatted: number;
   defensiveShare: number;
   assetDecimals: number;
@@ -34,6 +39,12 @@ export interface VaultState {
   assetAddress: Address;
   defensiveAddress: Address;
 }
+
+/**
+ * How long a vault-state read stays fresh. Deliberately below the pipeline
+ * cycle so a settled rotation is picked up on the following pass.
+ */
+const VAULT_STATE_TTL_MS = 4_000;
 
 export interface ExecuteResult {
   txHash: Hash;
@@ -104,6 +115,34 @@ export class ChainService {
     return config.chain.contracts.rwaPosition as Address;
   }
 
+  /** The vault every position is protected through, for dedup keys upstream. */
+  get vaultAddress(): Address | null {
+    return (config.chain.contracts.rwaPosition as Address) ?? null;
+  }
+
+  /**
+   * Serialises every state-changing call through one queue.
+   *
+   * The guardian is a single key, and the pipeline runs positions with
+   * `Promise.all`. Two concurrent writes both read the same pending nonce from
+   * the RPC, and one is rejected with "nonce too low / already known" — which
+   * is exactly what the logs showed. Chaining the writes means each transaction
+   * sees the nonce left by the one before it.
+   *
+   * Reads are not queued: they hold no nonce and would only be slowed down.
+   */
+  private serialize<T>(operation: () => Promise<T>): Promise<T> {
+    const next = this.writeQueue.then(operation, operation);
+    // A rejected link must not poison the queue for later writes.
+    this.writeQueue = next.then(
+      () => undefined,
+      () => undefined,
+    );
+    return next;
+  }
+
+  private writeQueue: Promise<unknown> = Promise.resolve();
+
   private async decimalsOf(token: Address): Promise<number> {
     const cached = this.decimalsCache.get(token);
     if (cached !== undefined) return cached;
@@ -116,8 +155,39 @@ export class ChainService {
     return decimals;
   }
 
-  /** Reads live vault state, or null when the chain is unavailable. */
+  /**
+   * Reads live vault state, or null when the chain is unavailable.
+   *
+   * Cached briefly because every position is protected through the same vault:
+   * without this, each cycle re-read identical state once per position — six
+   * RPC round-trips each, against a public testnet endpoint, several times a
+   * minute. The TTL is shorter than one cycle, so a rotation's effect is still
+   * observed on the very next pass.
+   */
   async readVaultState(): Promise<VaultState | null> {
+    if (!this.available || !this.publicClient) return null;
+
+    const cached = this.vaultStateCache;
+    if (cached && Date.now() - cached.at < VAULT_STATE_TTL_MS) return cached.value;
+
+    // Collapse concurrent callers onto one in-flight read.
+    if (this.vaultStateInFlight) return this.vaultStateInFlight;
+
+    this.vaultStateInFlight = this.readVaultStateUncached().finally(() => {
+      this.vaultStateInFlight = null;
+    });
+    return this.vaultStateInFlight;
+  }
+
+  /** Drops the cache so the next read reflects a just-settled transaction. */
+  invalidateVaultState(): void {
+    this.vaultStateCache = null;
+  }
+
+  private vaultStateCache: { at: number; value: VaultState | null } | null = null;
+  private vaultStateInFlight: Promise<VaultState | null> | null = null;
+
+  private async readVaultStateUncached(): Promise<VaultState | null> {
     if (!this.available || !this.publicClient) return null;
     try {
       const vault = this.vault();
@@ -144,13 +214,20 @@ export class ChainService {
         }) as Promise<Address>,
       ]);
 
-      const [assetDecimals, defensiveDecimals] = await Promise.all([
+      const [assetDecimals, defensiveDecimals, assetBalance] = await Promise.all([
         this.decimalsOf(assetAddress),
         this.decimalsOf(defensiveAddress),
+        this.publicClient!.readContract({
+          address: assetAddress,
+          abi: erc20Abi,
+          functionName: "balanceOf",
+          args: [vault],
+        }) as Promise<bigint>,
       ]);
 
-      return {
+      const value: VaultState = {
         totalAssets,
+        assetBalance,
         totalAssetsFormatted: Number(totalAssets) / 10 ** assetDecimals,
         defensiveShare: Number(defensiveBps) / 10_000,
         assetDecimals,
@@ -158,8 +235,13 @@ export class ChainService {
         assetAddress,
         defensiveAddress,
       };
+      this.vaultStateCache = { at: Date.now(), value };
+      return value;
     } catch (err) {
-      logger.warn({ err }, "vault state read failed");
+      logger.warn({ err: describeChainError(err) }, "vault state read failed");
+      // Cache the failure too, briefly: hammering an RPC that just failed for
+      // every position makes recovery slower, not faster.
+      this.vaultStateCache = { at: Date.now(), value: null };
       return null;
     }
   }
@@ -197,8 +279,10 @@ export class ChainService {
     reasoning: string;
   }): Promise<Hash | null> {
     if (!this.canSign || !this.walletClient || !this.publicClient || !this.account) return null;
+
+    return this.serialize(async () => {
     try {
-      const hash = await this.walletClient.writeContract({
+      const hash = await this.walletClient!.writeContract({
         address: config.chain.contracts.riskOracle as Address,
         abi: riskOracleAbi,
         functionName: "anchor",
@@ -210,16 +294,17 @@ export class ChainService {
           ACTION_ENUM[input.action],
           keccak256(toHex(input.reasoning)),
         ],
-        account: this.account,
-        chain: this.walletClient.chain,
+        account: this.account!,
+        chain: this.walletClient!.chain,
       });
-      await this.publicClient.waitForTransactionReceipt({ hash, confirmations: 1 });
+      await this.publicClient!.waitForTransactionReceipt({ hash, confirmations: 1 });
       logger.info({ hash, score: input.score }, "risk assessment anchored");
       return hash;
     } catch (err) {
-      logger.error({ err }, "risk anchoring failed");
+      logger.error({ err: describeChainError(err) }, "risk anchoring failed");
       return null;
     }
+    });
   }
 
   async isAssessmentFresh(): Promise<boolean> {
@@ -254,6 +339,9 @@ export class ChainService {
     const state = await this.readVaultState();
     if (!state) return null;
 
+    // Execution consumes a nonce too, so it shares the write queue with
+    // anchoring — otherwise a rotation racing an anchor loses the same way.
+    return this.serialize(async () => {
     try {
       // Nominal 1:1 conversion between asset and defensive units, less the
       // tolerated slippage.
@@ -266,7 +354,7 @@ export class ChainService {
       const minOut =
         (nominalOut * BigInt(10_000 - Math.min(9_999, input.maxSlippageBps))) / 10_000n;
 
-      const hash = await this.walletClient.writeContract({
+      const hash = await this.walletClient!.writeContract({
         address: config.chain.contracts.protectionExecutor as Address,
         abi: protectionExecutorAbi,
         functionName: "executeProtection",
@@ -280,11 +368,11 @@ export class ChainService {
             reasoningHash: keccak256(toHex(input.reasoning)),
           },
         ],
-        account: this.account,
-        chain: this.walletClient.chain,
+        account: this.account!,
+        chain: this.walletClient!.chain,
       });
 
-      const receipt = await this.publicClient.waitForTransactionReceipt({
+      const receipt = await this.publicClient!.waitForTransactionReceipt({
         hash,
         confirmations: 1,
       });
@@ -294,11 +382,14 @@ export class ChainService {
       }
 
       logger.info({ hash, amount: input.amountAssetUnits.toString() }, "protection executed");
+      // The rotation just changed the balances this cache describes.
+      this.invalidateVaultState();
       return { txHash: hash };
     } catch (err) {
-      logger.error({ err }, "protection execution failed");
+      logger.error({ err: describeChainError(err) }, "protection execution failed");
       return null;
     }
+    });
   }
 
   /** Health snapshot surfaced on /api/health. */
@@ -330,6 +421,21 @@ export class ChainService {
       };
     }
   }
+}
+
+/**
+ * Condenses a viem error into something readable.
+ *
+ * viem attaches the full request body, the ABI and a nested cause chain to
+ * every failure, which pino then serialises in full — thousands of characters
+ * that bury the one line that matters. This keeps the short message and the
+ * node's own detail, and drops the rest.
+ */
+function describeChainError(err: unknown): { reason: string; detail?: string } {
+  if (typeof err !== "object" || err === null) return { reason: String(err) };
+  const e = err as { shortMessage?: string; details?: string; message?: string };
+  const reason = (e.shortMessage ?? e.message ?? "chain call failed").split("\n")[0]!;
+  return e.details ? { reason, detail: e.details } : { reason };
 }
 
 let instance: ChainService | null = null;

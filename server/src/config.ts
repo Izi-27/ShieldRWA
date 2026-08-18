@@ -1,7 +1,16 @@
-import "dotenv/config";
+import dotenv from "dotenv";
 import fs from "node:fs";
 import path from "node:path";
 import { z } from "zod";
+
+// Tests must not inherit a developer's .env. Loading it made the suite depend
+// on local machine state: once a real CHAIN_RPC_URL and a deployment address
+// book existed, the API tests started exercising a live-chain code path they
+// were written to avoid, and failed. Test runs configure themselves entirely
+// through process.env.
+if (process.env.NODE_ENV !== "test") {
+  dotenv.config();
+}
 
 /**
  * All runtime configuration, validated once at boot. Anything the server can
@@ -26,7 +35,7 @@ const schema = z.object({
 
   // --- chain ---
   CHAIN_RPC_URL: z.string().url().optional(),
-  CHAIN_ID: z.coerce.number().int().positive().default(195),
+  CHAIN_ID: z.coerce.number().int().positive().default(1952),
   CHAIN_NAME: z.string().default("X Layer Testnet"),
   CHAIN_EXPLORER_URL: z.string().default("https://www.okx.com/web3/explorer/xlayer-test"),
   DEPLOYMENT_FILE: z.string().default("../contracts/deployments/xlayerTestnet.json"),
@@ -45,7 +54,7 @@ const schema = z.object({
 
   // Google Gemini.
   GEMINI_API_KEY: z.string().optional(),
-  GEMINI_MODEL: z.string().default("gemini-3.7-flash"),
+  GEMINI_MODEL: z.string().default("gemini-2.5-flash"),
 
   // Anthropic direct: sent as the `x-api-key` header.
   ANTHROPIC_API_KEY: z.string().optional(),
@@ -62,10 +71,30 @@ const schema = z.object({
   AI_EFFORT: z.enum(["low", "medium", "high", "xhigh", "max"]).default("medium"),
   AI_TIMEOUT_MS: z.coerce.number().int().positive().default(45_000),
 
+  // The risk score is deterministic and recomputed every cycle for free. The
+  // model is only worth calling when it would actually say something new, so
+  // narration is throttled to this interval and to material changes. Without
+  // this the pipeline issues ~24 requests/minute, which exhausts every free
+  // tier within a minute and costs real money on a paid one.
+  AI_MIN_INTERVAL_MS: z.coerce.number().int().nonnegative().default(90_000),
+  // Composite-score movement (0-100) that counts as material enough to
+  // re-narrate before the interval elapses.
+  AI_CHANGE_THRESHOLD: z.coerce.number().nonnegative().default(8),
+  // Hard process-wide ceiling on AI requests per minute, sized to the
+  // provider quota. Per-position gating cannot bound this on its own: every
+  // active position runs each cycle, so N positions multiply through it.
+  // Exceeding the quota costs a 429 and the deterministic fallback anyway,
+  // so the budget skips instead. Set 0 to disable.
+  AI_MAX_RPM: z.coerce.number().int().nonnegative().default(4),
+
   // --- market data ---
   MARKET_DATA_PROVIDER: z.enum(["coingecko", "simulated"]).default("simulated"),
   COINGECKO_BASE_URL: z.string().url().default("https://api.coingecko.com/api/v3"),
   MARKET_REFERENCE_ASSET: z.string().default("ethereum"),
+  // One upstream price read is shared across positions for this long. The
+  // pipeline samples per position per cycle, which without this would exceed
+  // the free CoinGecko rate limit within a minute.
+  MARKET_CACHE_MS: z.coerce.number().int().nonnegative().default(20_000),
 
   // --- risk pipeline ---
   RISK_CYCLE_MS: z.coerce.number().int().positive().default(5_000),
@@ -102,8 +131,10 @@ function build() {
   }
   const env = parsed.data;
 
-  // Explicit env vars win; the deployment address book fills the gaps.
-  const book = loadDeploymentBook(env.DEPLOYMENT_FILE);
+  // Explicit env vars win; the deployment address book fills the gaps. Skipped
+  // under test for the same reason as .env — a real deployment on disk must not
+  // change what the suite exercises.
+  const book = env.NODE_ENV === "test" ? null : loadDeploymentBook(env.DEPLOYMENT_FILE);
   const fromBook = book?.contracts ?? {};
 
   const contracts = {
@@ -188,12 +219,16 @@ function build() {
       model: env.AI_PROVIDER === "gemini" ? env.GEMINI_MODEL : env.ANTHROPIC_MODEL,
       effort: env.AI_EFFORT,
       timeoutMs: env.AI_TIMEOUT_MS,
+      maxRpm: env.AI_MAX_RPM,
+      minIntervalMs: env.AI_MIN_INTERVAL_MS,
+      changeThreshold: env.AI_CHANGE_THRESHOLD,
     },
 
     marketData: {
       provider: env.MARKET_DATA_PROVIDER,
       coingeckoBaseUrl: env.COINGECKO_BASE_URL,
       referenceAsset: env.MARKET_REFERENCE_ASSET,
+      cacheMs: env.MARKET_CACHE_MS,
     },
 
     risk: {

@@ -1,0 +1,127 @@
+# Render Blueprint for the ShieldRWA backend.
+# https://render.com/docs/blueprint-spec
+#
+# Apply from the Render dashboard: New > Blueprint, point it at this repo.
+# An existing service created by hand does NOT pick this up automatically —
+# either recreate it from the blueprint, or mirror the settings below.
+
+services:
+  - type: web
+    name: shieldrwa-api
+    runtime: node
+    plan: free
+    rootDir: server
+
+    # --include=dev is the whole point of this file. Render sets
+    # NODE_ENV=production, which makes npm omit devDependencies — and every
+    # @types/* package the build needs lives there. Without the flag `tsc`
+    # fails with TS7016 "Could not find a declaration file for module
+    # 'express'" on every typed dependency.
+    buildCommand: npm ci --include=dev && npm run build
+    startCommand: npm start
+
+    healthCheckPath: /api/health
+
+    envVars:
+      - key: NODE_ENV
+        value: production
+      # PORT and HOST are injected by Render; the server reads them via config.ts.
+
+      # Comma-separated. Point this at the deployed frontend origin.
+      - key: CORS_ORIGIN
+        sync: false
+
+      # SQLite lives on the instance filesystem, which Render wipes on every
+      # deploy and restart. Fine for a testnet demo — positions and decisions
+      # rebuild from chain and the risk pipeline. To persist it, move the
+      # service to a paid plan, attach a disk (see the commented block below),
+      # and set DATABASE_PATH=/var/data/shieldrwa.db.
+      - key: DATABASE_PATH
+        value: ./data/shieldrwa.db
+
+      # config.ts throws at boot in production if this is left at the dev
+      # default, so let Render generate one. Rotating it invalidates all
+      # outstanding session tokens.
+      - key: JWT_SECRET
+        generateValue: true
+
+      # ---------------------------------------------------------- chain
+      - key: CHAIN_RPC_URL
+        value: https://testrpc.xlayer.tech
+      - key: CHAIN_ID
+        value: "1952"
+      - key: CHAIN_NAME
+        value: X Layer Testnet
+      - key: CHAIN_EXPLORER_URL
+        value: https://www.okx.com/web3/explorer/xlayer-test
+
+      # contracts/deployments/ is gitignored, so the address book config.ts
+      # normally reads is not present in the deployed tree. These explicit
+      # addresses take its place — they mirror
+      # contracts/deployments/xlayerTestnet.json. Update both together after a
+      # redeploy of the contracts.
+      - key: DEPLOYMENT_FILE
+        value: ./deployments-not-present.json
+      - key: RWA_POSITION_ADDRESS
+        value: "0x22Ccc0840cD7d96D380E06bdd7fF8AF123E1e167"
+      - key: RISK_ORACLE_ADDRESS
+        value: "0x7F2cf8FeABC1Cc7f2eA42371Bd912D587107E69d"
+      - key: PROTECTION_EXECUTOR_ADDRESS
+        value: "0x5Ac1Ee1129B93FFfC0d2C87F7e77032988234148"
+      - key: DEX_ROUTER_ADDRESS
+        value: "0xbaC5330762e788D06fb4711aabe704B9E6fCf792"
+      - key: RWA_TOKEN_ADDRESS
+        value: "0x463E1cCE88F9dA94449D7E5fcD14b13859Af36C3"
+      - key: DEFENSIVE_TOKEN_ADDRESS
+        value: "0x2B4f0D013e25FCc0d7c9d226cB2225B8cB23DFE2"
+
+      # Backend signer holding GUARDIAN_ROLE and REPORTER_ROLE. Never commit
+      # this — set it in the dashboard. Without it the server reads the chain
+      # but never writes: no anchoring, no on-chain execution.
+      - key: GUARDIAN_PRIVATE_KEY
+        sync: false
+
+      # ------------------------------------------------------------- AI
+      - key: AI_PROVIDER
+        value: gemini
+      # Set in the dashboard. Absent, the Analyst and Guardian fall back to
+      # their deterministic implementations.
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_MODEL
+        value: gemini-2.5-flash
+      - key: AI_EFFORT
+        value: medium
+      - key: AI_TIMEOUT_MS
+        value: "45000"
+      - key: AI_MAX_RPM
+        value: "4"
+      - key: AI_MIN_INTERVAL_MS
+        value: "90000"
+      - key: AI_CHANGE_THRESHOLD
+        value: "8"
+
+      # ---------------------------------------------------- market data
+      - key: MARKET_DATA_PROVIDER
+        value: coingecko
+      - key: COINGECKO_BASE_URL
+        value: https://api.coingecko.com/api/v3
+      - key: MARKET_REFERENCE_ASSET
+        value: ethereum
+      - key: MARKET_CACHE_MS
+        value: "20000"
+
+      # -------------------------------------------------- risk pipeline
+      - key: RISK_CYCLE_MS
+        value: "5000"
+      - key: RISK_ANCHOR_INTERVAL_MS
+        value: "60000"
+      - key: PREDICTION_HORIZON_HOURS
+        value: "6"
+
+    # Persistent SQLite. Requires a paid instance type; uncomment together with
+    # DATABASE_PATH=/var/data/shieldrwa.db above.
+    # disk:
+    #   name: shieldrwa-data
+    #   mountPath: /var/data
+    #   sizeGB: 1

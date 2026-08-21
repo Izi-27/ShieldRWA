@@ -16,7 +16,7 @@ vi.mock("../ai/client.js", () => ({
   getAnthropic: () => null,
 }));
 
-const { openDatabase, setDatabase, closeDatabase } = await import("../db/index.js");
+const { openDatabase, setDatabase, closeDatabase, getDatabase } = await import("../db/index.js");
 const { createApp } = await import("./server.js");
 const { ProtectionEngine } = await import("../pipeline/engine.js");
 
@@ -117,6 +117,27 @@ describe("wallet authentication", () => {
     await request(app).post("/api/auth/verify").send(body).expect(200);
     // Same signature, same nonce, second time.
     await request(app).post("/api/auth/verify").send(body).expect(401);
+  });
+
+  it("still accepts a token whose user row was wiped underneath it", async () => {
+    // The deployed host has an ephemeral disk but a persistent JWT_SECRET, so a
+    // token routinely outlives the database it was minted against. The token is
+    // proof enough to rebuild the row — otherwise the first write after a
+    // restart dies on positions.owner_address's foreign key.
+    const token = await signIn();
+    const db = getDatabase();
+    db.prepare(`DELETE FROM users WHERE address = ?`).run(account.address.toLowerCase());
+
+    await request(app)
+      .post("/api/positions")
+      .set("Authorization", `Bearer ${token}`)
+      .send({ assetSymbol: "RWA-T9", assetName: "RWA Treasury Note T9", valueUsd: 5_000 })
+      .expect(201);
+
+    const row = db.prepare(`SELECT address FROM users WHERE address = ?`).get(
+      account.address.toLowerCase(),
+    );
+    expect(row).toBeDefined();
   });
 
   it("rejects a malformed address", async () => {

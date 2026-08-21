@@ -90,6 +90,10 @@ const schema = z.object({
   // --- market data ---
   MARKET_DATA_PROVIDER: z.enum(["coingecko", "simulated"]).default("simulated"),
   COINGECKO_BASE_URL: z.string().url().default("https://api.coingecko.com/api/v3"),
+  // Demo-plan key. Without one the public API is rate-limited per source IP,
+  // which on a shared host means the quota is spent by other tenants before
+  // this service gets a turn. With a key the limit follows the key instead.
+  COINGECKO_API_KEY: z.string().optional(),
   MARKET_REFERENCE_ASSET: z.string().default("ethereum"),
   // One upstream price read is shared across positions for this long. The
   // pipeline samples per position per cycle, which without this would exceed
@@ -227,6 +231,7 @@ function build() {
     marketData: {
       provider: env.MARKET_DATA_PROVIDER,
       coingeckoBaseUrl: env.COINGECKO_BASE_URL,
+      coingeckoApiKey: env.COINGECKO_API_KEY,
       referenceAsset: env.MARKET_REFERENCE_ASSET,
       cacheMs: env.MARKET_CACHE_MS,
     },

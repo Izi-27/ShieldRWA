@@ -74,6 +74,17 @@ class PriceWindow {
   }
 }
 
+/** Upstream rejection that carries the server's own retry hint, when it gave one. */
+class UpstreamError extends Error {
+  constructor(message: string, readonly retryAfterMs?: number) {
+    super(message);
+  }
+}
+
+/** Shortest and longest we will wait between attempts once the feed starts failing. */
+const BACKOFF_BASE_MS = 15_000;
+const BACKOFF_CAP_MS = 300_000;
+
 /** Reads a real price series from the CoinGecko public API. */
 export class CoinGeckoProvider implements MarketProvider {
   readonly kind = "live" as const;
@@ -81,24 +92,59 @@ export class CoinGeckoProvider implements MarketProvider {
   private lastVolume = 0;
   private lastVolumeChangePct = 0;
   private consecutiveFailures = 0;
+  /** Epoch ms before which `sample` must not touch the network. */
+  private nextAttemptAt = 0;
 
   constructor(
     private readonly assetId: string = config.marketData.referenceAsset,
     private readonly baseUrl: string = config.marketData.coingeckoBaseUrl,
+    private readonly apiKey: string | undefined = config.marketData.coingeckoApiKey,
   ) {}
+
+  /**
+   * Last known window, reported honestly as simulated. Used both when a fetch
+   * fails and while we are backing off from one that did.
+   */
+  private degraded(): MarketSignals {
+    return {
+      volatilityPct: round(this.window.volatilityPct(), 3),
+      priceDeviationPct: round(this.window.deviationPct(), 3),
+      drawdownPct: round(this.window.drawdownPct(), 3),
+      volumeChangePct: 0,
+      priceUsd: this.window.latest() ?? 0,
+      source: "simulated",
+    };
+  }
 
   async sample(): Promise<MarketSignals> {
     const url =
       `${this.baseUrl}/simple/price?ids=${encodeURIComponent(this.assetId)}` +
       `&vs_currencies=usd&include_24hr_vol=true&include_24hr_change=true`;
 
+    // While backing off, serve the last window without touching the network.
+    // Hammering a rate limiter is what extends its penalty.
+    if (Date.now() < this.nextAttemptAt) return this.degraded();
+
     try {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 8_000);
-      const res = await fetch(url, { signal: controller.signal });
+      const res = await fetch(url, {
+        signal: controller.signal,
+        // Sent only on the demo plan's own host; the pro host expects a
+        // different header name, so a key is not forwarded blindly.
+        headers: this.apiKey ? { "x-cg-demo-api-key": this.apiKey } : {},
+      });
       clearTimeout(timer);
 
-      if (!res.ok) throw new Error(`CoinGecko responded ${res.status}`);
+      if (!res.ok) {
+        // 429 and 5xx often carry Retry-After. Honour it over our own guess.
+        const header = res.headers.get("retry-after");
+        const seconds = header ? Number(header) : NaN;
+        throw new UpstreamError(
+          `CoinGecko responded ${res.status}`,
+          Number.isFinite(seconds) && seconds > 0 ? seconds * 1_000 : undefined,
+        );
+      }
       const body = (await res.json()) as Record<
         string,
         { usd?: number; usd_24h_vol?: number; usd_24h_change?: number }
@@ -107,6 +153,7 @@ export class CoinGeckoProvider implements MarketProvider {
       if (!entry?.usd) throw new Error(`no price for ${this.assetId}`);
 
       this.consecutiveFailures = 0;
+      this.nextAttemptAt = 0;
       this.window.push(entry.usd);
 
       const volume = entry.usd_24h_vol ?? 0;
@@ -125,21 +172,29 @@ export class CoinGeckoProvider implements MarketProvider {
       };
     } catch (err) {
       this.consecutiveFailures++;
+
+      // Exponential from the first failure, capped, unless the server told us
+      // exactly how long to wait.
+      const hinted = err instanceof UpstreamError ? err.retryAfterMs : undefined;
+      const backoffMs =
+        hinted ??
+        Math.min(BACKOFF_BASE_MS * 2 ** (this.consecutiveFailures - 1), BACKOFF_CAP_MS);
+      this.nextAttemptAt = Date.now() + backoffMs;
+
       logger.warn(
-        { err, assetId: this.assetId, consecutiveFailures: this.consecutiveFailures },
+        {
+          err,
+          assetId: this.assetId,
+          consecutiveFailures: this.consecutiveFailures,
+          retryInMs: backoffMs,
+          hintedByServer: hinted !== undefined,
+          hasApiKey: this.apiKey !== undefined,
+        },
         "market data fetch failed — reporting last known window as simulated",
       );
       // Degrade honestly: keep serving the pipeline, but stop claiming the
       // numbers are live.
-      const last = this.window.latest() ?? 0;
-      return {
-        volatilityPct: round(this.window.volatilityPct(), 3),
-        priceDeviationPct: round(this.window.deviationPct(), 3),
-        drawdownPct: round(this.window.drawdownPct(), 3),
-        volumeChangePct: 0,
-        priceUsd: last,
-        source: "simulated",
-      };
+      return this.degraded();
     }
   }
 }
@@ -244,7 +299,11 @@ export function createMarketProvider(): MarketProvider {
 
   if (config.marketData.provider === "coingecko") {
     logger.info(
-      { asset: config.marketData.referenceAsset, cacheMs: ttl },
+      {
+        asset: config.marketData.referenceAsset,
+        cacheMs: ttl,
+        hasApiKey: config.marketData.coingeckoApiKey !== undefined,
+      },
       "using live market data",
     );
     return new CachedMarketProvider(new CoinGeckoProvider(), ttl);

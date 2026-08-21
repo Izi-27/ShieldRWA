@@ -106,10 +106,18 @@ services:
         value: coingecko
       - key: COINGECKO_BASE_URL
         value: https://api.coingecko.com/api/v3
+      # Set in the dashboard. Without it CoinGecko rate-limits by source IP,
+      # which Render shares across tenants — the quota is gone before this
+      # service asks for it, and the feed degrades to its last known window.
+      - key: COINGECKO_API_KEY
+        sync: false
       - key: MARKET_REFERENCE_ASSET
         value: ethereum
+      # One upstream read shared across positions for this long. The 6h
+      # prediction horizon does not need 20s freshness, and 60s cuts upstream
+      # calls to a third.
       - key: MARKET_CACHE_MS
-        value: "20000"
+        value: "60000"
 
       # -------------------------------------------------- risk pipeline
       - key: RISK_CYCLE_MS

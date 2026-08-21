@@ -1,7 +1,7 @@
 import type { NextFunction, Request, Response } from "express";
 import { AuthError, verifyToken } from "./siwe.js";
 import { getDatabase } from "../db/index.js";
-import { getPosition } from "../db/repositories.js";
+import { getPosition, upsertUser } from "../db/repositories.js";
 
 declare global {
   // eslint-disable-next-line @typescript-eslint/no-namespace
@@ -21,6 +21,14 @@ export function requireAuth(req: Request, res: Response, next: NextFunction): vo
   }
   try {
     const payload = verifyToken(header.slice(7));
+    // Re-assert the user row on every authenticated request. A valid token is
+    // proof the address signed for it, so the row can be rebuilt from the token
+    // alone — and it has to be: positions.owner_address is a foreign key into
+    // users, while the token is stateless and outlives the database on a host
+    // with an ephemeral disk. Without this, a session that survives a restart
+    // authenticates cleanly and then fails its first write on a dangling key.
+    // Doubles as the last_seen_at heartbeat.
+    upsertUser(getDatabase(), payload.sub);
     req.address = payload.sub;
     next();
   } catch (err) {
